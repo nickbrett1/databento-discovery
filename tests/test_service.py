@@ -33,8 +33,14 @@ class FakeMetadata:
         return [{"name": "price", "type": "int64"}]
 
     def get_dataset_range(self, dataset):
+        # The real API nests a {start, end} block per entitled schema alongside
+        # the dataset-level start/end, so the fake must nest too.
         self._calls.append(("get_dataset_range", dataset))
-        return {"start": "2020-01-01", "end": "2025-01-01"}
+        return {
+            "start": "2020-01-01",
+            "end": "2025-01-01",
+            "mbo": {"start": "2020-01-01", "end": "2025-01-01"},
+        }
 
     def list_unit_prices(self, dataset):
         self._calls.append(("list_unit_prices", dataset))

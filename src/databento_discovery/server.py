@@ -75,8 +75,12 @@ def build_server(
         return svc.list_fields(schema, encoding, dataset)
 
     @mcp.tool()
-    def get_dataset_range(dataset: str) -> dict[str, str]:
-        """Return a dataset's available {start_date, end_date}, as your key is entitled."""
+    def get_dataset_range(dataset: str) -> dict[str, Any]:
+        """Return a dataset's available range, as your key is entitled.
+
+        Top-level ``start``/``end`` cover the dataset; any per-schema key (e.g.
+        ``mbo``) carries its own nested ``{start, end}`` block.
+        """
         return svc.get_dataset_range(dataset)
 
     @mcp.tool()

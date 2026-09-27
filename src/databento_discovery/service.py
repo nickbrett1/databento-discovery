@@ -96,7 +96,7 @@ class DatabentoService:
             dataset=dataset,
         )
 
-    def get_dataset_range(self, dataset: str) -> dict[str, str]:
+    def get_dataset_range(self, dataset: str) -> dict[str, Any]:
         return self._cached(
             ("get_dataset_range", dataset), self._client.metadata.get_dataset_range, dataset
         )
