@@ -1,6 +1,35 @@
 # databento-discovery
 
-A databento-discovery project generated with genproj
+A read-only, **metadata-only** MCP server over Databento's published datasets.
+It answers "what exists, what's covered, and what would a slice cost?" — for
+free — and deliberately cannot download data or submit batch jobs. The spend
+boundary is enforced by what is absent: there is no `batch_submit_job` and no
+`timeseries_get_range`.
+
+Served over Streamable HTTP at `http://<host>:8772/mcp`; `GET /health` returns
+a JSON status. Config: `DATABENTO_API_KEY` (required), `MCP_PORT` (default 8772).
+
+## Tools
+
+Nine tools, all free and read-only:
+
+| Tool | Returns |
+|---|---|
+| `list_datasets` | dataset codes, e.g. `XNAS.ITCH` |
+| `list_publishers` | publisher → datasets + venues |
+| `list_schemas` | `mbo`, `mbp-10`, `trades`, `ohlcv-1m`, … |
+| `list_fields` | field name, type, description, enum values |
+| `get_dataset_range` | `{start_date, end_date}`, entitlement-aware |
+| `get_dataset_condition` | per-date `full` / `partial` / `missing` / `untested` |
+| `list_unit_prices` | $/GB per feed mode × schema |
+| `estimate_cost` | `{cost_usd, record_count, billable_bytes}` for a slice |
+| `resolve_symbols` | symbol → instrument_id over a date range |
+
+Slow-moving reads (datasets, publishers, schemas, fields, unit prices) are
+cached for an hour; condition and cost estimates never are. Calls are held to
+~60/minute by an in-process limiter that returns a clean "retry in Ns".
+
+This project was generated with genproj.
 
 ## Capabilities
 
