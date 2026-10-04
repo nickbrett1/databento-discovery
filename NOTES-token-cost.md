@@ -256,3 +256,34 @@ The recommendation above is now implemented on a branch.
   description no longer promises prose/enum values.
 
 **PR:** https://github.com/nickbrett1/databento-discovery/pull/2 (branch `fix/resolve-symbols-pagination`).
+
+---
+
+# Follow-up (not part of the merge): agent-side paging guidance
+
+The `data-sourcing-agent`'s `prompts/instructions.md` treats `ALL_SYMBOLS` as
+simply allowed and never mentions `truncated`/`next_offset`. Once this fix is
+live, a call that previously returned 12,593 mappings returns **100 with
+`truncated: true`** — and an LLM with no paging instruction may wrongly conclude
+that 100 *is* the universe (a silent under-read, which is worse than the old
+bloat). Suggested wording (for `data-sourcing-agent`, **not** changed here):
+
+> **`resolve_symbols` is paginated.** It returns at most `limit` symbol →
+> instrument_id mappings (default 100, max 1000), plus `total`, `returned`,
+> `offset`, `next_offset` and `truncated`. `truncated: true` means there are more
+> mappings than this page — it does **not** mean the call failed.
+>
+> - To get the whole universe, page: call again with `offset = next_offset` and
+>   repeat until `truncated` is `false` (i.e. `next_offset` is `null`). Do not
+>   re-issue the identical call — that returns the same first page.
+> - Never treat `returned` (e.g. 100) as the size of the universe; use `total`.
+> - Prefer narrowing the request to the symbols you actually need over paging a
+>   full `ALL_SYMBOLS` set: a bulk resolve matches ~12k symbols, so paging it at
+>   the maximum limit is ~13 rate-limited calls. Only page the whole set when the
+>   ticket genuinely needs every mapping.
+> - Do not paste a full paged universe into the request/ticket; record only the
+>   count, or the specific instruments you will actually request.
+
+Rationale: the instruction must make `truncated`/`next_offset` load-bearing, so
+the agent never mistakes a bounded page for a complete answer, and never burns
+the ~60/min rate budget paging a universe it does not need.
