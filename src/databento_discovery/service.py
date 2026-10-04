@@ -29,6 +29,16 @@ RATE_LIMIT_PER_MINUTE = 60
 DEFAULT_CONDITION_DAYS = 30
 MAX_CONDITION_DAYS = 366
 
+# `resolve_symbols` with a bulk spec (e.g. ``ALL_SYMBOLS`` on a US-equities
+# dataset) matches ~12.6k symbols and used to return ~1.4 MB of JSON in one
+# result. That blob lands in the caller's context and is re-sent whole every
+# turn, which is how a single call produced 400k-token prompts. Cap it the same
+# way the condition window is capped: page the *response* rather than truncate
+# it, so nothing the caller asked for is lost. A page of ~100 mappings measures
+# ~11 KB / ~3k tokens.
+DEFAULT_SYMBOL_LIMIT = 100
+MAX_SYMBOL_LIMIT = 1000
+
 
 class DatabentoQueryError(Exception):
     """A Databento call failed in a way worth surfacing verbatim to the model."""
@@ -106,7 +116,10 @@ class DatabentoService:
             ("list_unit_prices", dataset), self._client.metadata.list_unit_prices, dataset
         )
 
-    # -- request-specific (never cached) -----------------------------------
+    # -- request-specific (never cached) ------------------------------------
+    # Exception: `resolve_symbols` caches its full upstream snapshot so a caller
+    # can page one consistent result without re-fetching the whole universe per
+    # page. See its docstring.
 
     def get_dataset_condition(
         self,
@@ -178,9 +191,34 @@ class DatabentoService:
         end_date: str | dt.date | None = None,
         stype_in: str = "raw_symbol",
         stype_out: str = "instrument_id",
+        limit: int | None = None,
+        offset: int = 0,
     ) -> dict[str, Any]:
-        """Map symbols to instrument ids over a date range (Symbology API)."""
-        return self._call(
+        """Map symbols to instrument ids over a date range (Symbology API).
+
+        The upstream response maps one entry per symbol, and a bulk spec such as
+        ``ALL_SYMBOLS`` matches thousands of them (~1.4 MB / ~358k tokens for a
+        US-equities dataset). Returning that whole would blow the caller's
+        context, so the result is **paged**: at most ``limit`` mappings (default
+        :data:`DEFAULT_SYMBOL_LIMIT`, hard maximum :data:`MAX_SYMBOL_LIMIT`) are
+        returned per call, with ``offset`` / ``next_offset`` / ``truncated`` /
+        ``total`` so the caller can page through every mapping losslessly.
+
+        The full upstream snapshot is cached per request so that paging is cheap
+        and every page is sliced from one consistent, stable-ordered result.
+        """
+        page_limit = _symbol_limit(limit)
+        page_offset = _symbol_offset(offset)
+        raw = self._cached(
+            (
+                "resolve_symbols",
+                dataset,
+                _symbols_key(symbols),
+                stype_in,
+                stype_out,
+                str(start_date),
+                None if end_date is None else str(end_date),
+            ),
             self._client.symbology.resolve,
             dataset,
             symbols,
@@ -189,6 +227,7 @@ class DatabentoService:
             start_date=start_date,
             end_date=end_date,
         )
+        return _page_resolve(raw, page_limit, page_offset)
 
 
 def _translate(exc: BentoClientError) -> Exception:
@@ -219,3 +258,82 @@ def _to_date(value: dt.date | str | None) -> dt.date | None:
 def _key_date(value: dt.date | str | None) -> str | None:
     as_date = _to_date(value)
     return as_date.isoformat() if as_date is not None else None
+
+
+def _symbols_key(symbols: Sequence[str | int] | str | int) -> Any:
+    """Normalise the ``symbols`` argument into something hashable for caching."""
+    if isinstance(symbols, (list, tuple, set)):
+        return tuple(str(s) for s in symbols)
+    return str(symbols)
+
+
+def _symbol_limit(limit: int | None) -> int:
+    """Resolve a requested page size to an effective one, bounded by the max."""
+    if limit is None:
+        return DEFAULT_SYMBOL_LIMIT
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise DatabentoQueryError("limit must be a positive integer")
+    return min(limit, MAX_SYMBOL_LIMIT)
+
+
+def _symbol_offset(offset: int) -> int:
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise DatabentoQueryError("offset must be a non-negative integer")
+    return offset
+
+
+def _page_resolve(raw: Any, limit: int, offset: int) -> dict[str, Any]:
+    """Slice one upstream ``symbology.resolve`` response into a paged envelope.
+
+    The upstream ``result`` is a mapping of symbol -> interval list. Keys are
+    sorted before slicing so that paging stays stable and lossless even across
+    separate upstream fetches. Everything else the API returns is preserved
+    (``symbols``/``stype_in``/``stype_out``/``start_date``/``end_date``/
+    ``partial``/``not_found``/``message``/``status``) so no information is lost.
+    """
+    envelope: dict[str, Any] = {
+        "result": None,
+        "total": None,
+        "returned": None,
+        "offset": offset,
+        "next_offset": None,
+        "truncated": False,
+        "limit": limit,
+    }
+
+    mapping = raw.get("result") if isinstance(raw, dict) else None
+    if isinstance(mapping, dict):
+        keys = sorted(mapping)
+        total = len(keys)
+        page_keys = keys[offset : offset + limit]
+        page = {key: mapping[key] for key in page_keys}
+        returned = len(page)
+        consumed = offset + returned
+        next_offset = consumed if consumed < total else None
+        envelope.update(
+            result=page,
+            total=total,
+            returned=returned,
+            next_offset=next_offset,
+            truncated=next_offset is not None,
+        )
+    else:
+        # Unexpected shape (or a non-paged payload): surface it verbatim rather
+        # than inventing a page, so a future upstream change degrades loudly.
+        envelope["result"] = mapping if mapping is not None else raw
+
+    if isinstance(raw, dict):
+        for key in (
+            "symbols",
+            "stype_in",
+            "stype_out",
+            "start_date",
+            "end_date",
+            "partial",
+            "not_found",
+            "message",
+            "status",
+        ):
+            if key in raw:
+                envelope[key] = raw[key]
+    return envelope

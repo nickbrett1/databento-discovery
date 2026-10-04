@@ -23,11 +23,28 @@ Nine tools, all free and read-only:
 | `get_dataset_condition` | per-date `full` / `partial` / `missing` / `untested` |
 | `list_unit_prices` | $/GB per feed mode × schema |
 | `estimate_cost` | `{cost_usd, record_count, billable_bytes}` for a slice |
-| `resolve_symbols` | symbol → instrument_id over a date range |
+| `resolve_symbols` | paged symbol → instrument_id map (see below) |
 
 Slow-moving reads (datasets, publishers, schemas, fields, unit prices) are
 cached for an hour; condition and cost estimates never are. Calls are held to
 ~60/minute by an in-process limiter that returns a clean "retry in Ns".
+
+`resolve_symbols` is **paged**, because a bulk spec such as `ALL_SYMBOLS` on a
+US-equities dataset matches ~12k symbols (~1.4 MB of JSON, ~358k tokens) — far
+more than one tool result should ever put in a model's context. It returns a
+self-describing envelope:
+
+```json
+{"result": {"AAPL": [{"d0": "…", "d1": "…", "s": "38"}]},
+ "total": 12593, "returned": 100, "offset": 0,
+ "next_offset": 100, "truncated": true,
+ "limit": 100, "status": 0, "partial": [], "not_found": []}
+```
+
+`limit` defaults to 100 (max 1000) and `offset` pages through the full result, so
+nothing is dropped — unlike a head/tail truncation, which would silently lose
+instrument ids and provoke a retry. `list_fields` returns `{name, type}` only:
+the API carries no per-field prose or value sets.
 
 This project was generated with genproj.
 

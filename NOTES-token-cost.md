@@ -217,3 +217,40 @@ the order of magnitude — the blob is the dominant term — is robust.)
 - **Immediate mitigation while the schema fix lands:** have the service reject or
   bound `ALL_SYMBOLS`/broad expansions over wide windows, since no legitimate
   discovery answer needs 12,000 symbol rows inline.
+
+---
+
+# Addendum — implementation (2026-10-04, later the same day)
+
+The recommendation above is now implemented on a branch.
+
+## What changed
+
+- **`service.resolve_symbols`** gained `limit` / `offset` and returns a paged
+  envelope: `{result, total, returned, offset, next_offset, truncated, limit}`
+  plus the upstream passthrough fields (`symbols`, `stype_in`, `stype_out`,
+  `start_date`, `end_date`, `partial`, `not_found`, `message`, `status`).
+- **Constants** mirroring the condition cap: `DEFAULT_SYMBOL_LIMIT = 100`,
+  `MAX_SYMBOL_LIMIT = 1000`. A default page is ~11 KB (~3k tokens); a max page is
+  ~114 KB (~28k tokens). The upstream snapshot is cached per request so pages are
+  sliced from one consistent, stably-sorted result (keys sorted before slicing).
+- **Losslessness:** every mapping is reachable by paging; `truncated` is true iff
+  `next_offset is not None`. No silent elision, so no repair loop.
+- **`server.resolve_symbols`** exposes `limit`/`offset` and documents the envelope.
+- **`server.list_fields` docstring fixed** — it now states the tool returns
+  `{name, type}` only, matching the measured API response (`mbo` = 682 bytes).
+
+## Tests (all green, `30 passed`, `ruff` clean)
+
+- default limit is bounded and `truncated`/`next_offset` are set;
+- paging with `limit=MAX` walks the full 5,000-entry result with no duplicates and
+  no omissions;
+- `truncated` is accurate for first / middle / last / exact-fit pages;
+- `offset` beyond the end returns an empty page (still lossless);
+- over-max `limit` is clamped (not rejected — clamping avoids a repair loop);
+- bad `limit`/`offset` raise `DatabentoQueryError`;
+- pages share one cached upstream snapshot (1 upstream call for 3 pages);
+- **regression:** a 12,593-symbol `ALL_SYMBOLS` call now returns < 50 KB, was
+  ~1.43 MB;
+- the `resolve_symbols` tool declares `limit`/`offset`; the `list_fields`
+  description no longer promises prose/enum values.
