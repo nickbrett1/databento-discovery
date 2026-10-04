@@ -1,12 +1,15 @@
 """Unit tests for the Databento service -- no network is ever touched."""
 
 import datetime as dt
+import json
 
 import pytest
 
 from databento_discovery.ratelimit import RateLimited, RateLimiter
 from databento_discovery.service import (
     DEFAULT_CONDITION_DAYS,
+    DEFAULT_SYMBOL_LIMIT,
+    MAX_SYMBOL_LIMIT,
     DatabentoQueryError,
     DatabentoService,
 )
@@ -64,23 +67,52 @@ class FakeMetadata:
 
 
 class FakeSymbology:
-    def __init__(self, calls: list) -> None:
+    """Mimics ``symbology.resolve``: a dict of symbol -> interval list.
+
+    ``bulk_size`` controls how many symbols a bulk ``ALL_SYMBOLS`` request
+    matches, so tests can reproduce the ~12.6k-symbol / ~1.4 MB production case.
+    """
+
+    def __init__(self, calls: list, bulk_size: int = 0) -> None:
         self._calls = calls
+        self._bulk_size = bulk_size
 
     def resolve(self, dataset, symbols, stype_in, stype_out, start_date, end_date=None):
         self._calls.append(("resolve", dataset, symbols, stype_in, stype_out, start_date))
-        return {"result": {"AAPL": [{"instrument_id": 1, "start_date": "2024-08-05"}]}}
+        bulk = symbols == "ALL_SYMBOLS" or (
+            isinstance(symbols, (list, tuple)) and "ALL_SYMBOLS" in symbols
+        )
+        if bulk:
+            keys = [f"SYM{i:05d}" for i in range(self._bulk_size or 5000)]
+        elif isinstance(symbols, str):
+            keys = [symbols]
+        else:
+            keys = [str(s) for s in symbols]
+        return {
+            "result": {
+                k: [{"d0": "2024-08-05", "d1": "2024-09-05", "s": "38"}] for k in keys
+            },
+            "symbols": [symbols] if isinstance(symbols, str) else list(symbols),
+            "stype_in": stype_in,
+            "stype_out": stype_out,
+            "start_date": str(start_date),
+            "end_date": str(end_date) if end_date is not None else None,
+            "partial": [],
+            "not_found": [],
+            "message": "OK",
+            "status": 0,
+        }
 
 
 class FakeClient:
-    def __init__(self) -> None:
+    def __init__(self, bulk_size: int = 0) -> None:
         self.calls: list = []
         self.metadata = FakeMetadata(self.calls)
-        self.symbology = FakeSymbology(self.calls)
+        self.symbology = FakeSymbology(self.calls, bulk_size=bulk_size)
 
 
-def make_service(**kwargs) -> tuple[DatabentoService, FakeClient]:
-    client = FakeClient()
+def make_service(*, bulk_size: int = 0, **kwargs) -> tuple[DatabentoService, FakeClient]:
+    client = FakeClient(bulk_size=bulk_size)
     return DatabentoService(client=client, **kwargs), client
 
 
@@ -182,8 +214,139 @@ def test_resolve_symbols_passes_through_to_symbology():
 
     result = service.resolve_symbols("XNAS.ITCH", ["AAPL"], start_date="2024-08-05")
 
-    assert "result" in result
+    assert result["result"] == {"AAPL": [{"d0": "2024-08-05", "d1": "2024-09-05", "s": "38"}]}
     assert client.calls[-1][0] == "resolve"
+
+
+def test_resolve_envelope_is_self_describing():
+    service, _ = make_service()
+
+    out = service.resolve_symbols("XNAS.ITCH", ["AAPL"], start_date="2024-08-05")
+
+    assert {"total", "returned", "offset", "next_offset", "truncated", "result"} <= set(out)
+    assert out["total"] == 1
+    assert out["returned"] == 1
+    assert out["offset"] == 0
+    assert out["next_offset"] is None
+    assert out["truncated"] is False
+    # Upstream metadata is preserved verbatim.
+    assert out["stype_in"] == "raw_symbol"
+    assert out["stype_out"] == "instrument_id"
+    assert out["status"] == 0
+    assert out["partial"] == []
+    assert out["not_found"] == []
+
+
+def test_resolve_default_limit_is_bounded():
+    service, _ = make_service(bulk_size=5000)
+
+    out = service.resolve_symbols(
+        "XNAS.ITCH", "ALL_SYMBOLS", start_date="2024-08-05", end_date="2024-09-05"
+    )
+
+    assert out["total"] == 5000
+    assert out["returned"] == DEFAULT_SYMBOL_LIMIT
+    assert out["limit"] == DEFAULT_SYMBOL_LIMIT
+    assert len(out["result"]) == DEFAULT_SYMBOL_LIMIT
+    assert out["truncated"] is True
+    assert out["next_offset"] == DEFAULT_SYMBOL_LIMIT
+    # A default page stays in the low thousands of tokens (~11 KB of JSON).
+    assert len(json.dumps(out).encode()) < 20_000
+
+
+def test_resolve_rejects_bad_limit_and_offset():
+    service, _ = make_service(bulk_size=10)
+
+    with pytest.raises(DatabentoQueryError, match="limit"):
+        service.resolve_symbols("XNAS.ITCH", "AAPL", start_date="2024-08-05", limit=0)
+    with pytest.raises(DatabentoQueryError, match="offset"):
+        service.resolve_symbols("XNAS.ITCH", "AAPL", start_date="2024-08-05", offset=-1)
+
+
+def test_resolve_over_max_limit_is_clamped_not_rejected():
+    service, _ = make_service(bulk_size=5000)
+
+    out = service.resolve_symbols(
+        "XNAS.ITCH", "ALL_SYMBOLS", start_date="2024-08-05", limit=10_000
+    )
+
+    assert out["limit"] == MAX_SYMBOL_LIMIT
+    assert out["returned"] == MAX_SYMBOL_LIMIT
+    assert out["truncated"] is True
+
+
+def test_resolve_truncated_flag_is_accurate():
+    service, _ = make_service(bulk_size=250)
+
+    first = service.resolve_symbols("XNAS.ITCH", "ALL_SYMBOLS", start_date="2024-08-05", limit=100)
+    assert (first["returned"], first["truncated"], first["next_offset"]) == (100, True, 100)
+
+    middle = service.resolve_symbols(
+        "XNAS.ITCH", "ALL_SYMBOLS", start_date="2024-08-05", limit=100, offset=100
+    )
+    assert (middle["returned"], middle["truncated"], middle["next_offset"]) == (100, True, 200)
+
+    last = service.resolve_symbols(
+        "XNAS.ITCH", "ALL_SYMBOLS", start_date="2024-08-05", limit=100, offset=200
+    )
+    assert (last["returned"], last["truncated"], last["next_offset"]) == (50, False, None)
+
+    # Reading exactly the full result is not "truncated".
+    whole = service.resolve_symbols(
+        "XNAS.ITCH", "ALL_SYMBOLS", start_date="2024-08-05", limit=250
+    )
+    assert (whole["returned"], whole["truncated"], whole["next_offset"]) == (250, False, None)
+
+
+def test_resolve_paging_is_lossless_across_the_full_result():
+    service, _ = make_service(bulk_size=5000)
+
+    seen: dict[str, object] = {}
+    offset = 0
+    pages = 0
+    while True:
+        out = service.resolve_symbols(
+            "XNAS.ITCH", "ALL_SYMBOLS", start_date="2024-08-05", limit=MAX_SYMBOL_LIMIT, offset=offset
+        )
+        assert out["offset"] == offset
+        assert out["truncated"] == (out["next_offset"] is not None)
+        assert out["total"] == 5000
+        for key, value in out["result"].items():
+            assert key not in seen, f"duplicate {key} while paging"
+            seen[key] = value
+        if out["next_offset"] is None:
+            break
+        offset = out["next_offset"]
+        pages += 1
+        assert pages < 20, "paging did not converge"
+
+    assert len(seen) == 5000
+    assert set(seen) == {f"SYM{i:05d}" for i in range(5000)}
+
+
+def test_resolve_pages_share_one_cached_upstream_snapshot():
+    service, client = make_service(bulk_size=5000)
+
+    for offset in (0, 1000, 2000):
+        service.resolve_symbols(
+            "XNAS.ITCH", "ALL_SYMBOLS", start_date="2024-08-05", limit=1000, offset=offset
+        )
+
+    assert len([c for c in client.calls if c[0] == "resolve"]) == 1
+
+
+def test_bulk_all_symbols_is_no_longer_megabytes():
+    """Regression: this call used to return ~1.43 MB / ~358k tokens in one go."""
+    service, _ = make_service(bulk_size=12593)
+
+    out = service.resolve_symbols(
+        "XNAS.ITCH", "ALL_SYMBOLS", start_date="2024-01-01", end_date="2024-03-01"
+    )
+
+    payload = len(json.dumps(out).encode())
+    assert out["total"] == 12593
+    assert out["returned"] == DEFAULT_SYMBOL_LIMIT
+    assert payload < 50_000, f"bulk page should be bounded, got {payload} bytes"
 
 
 def test_rate_limited_client_error_is_translated():

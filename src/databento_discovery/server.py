@@ -71,7 +71,11 @@ def build_server(
 
     @mcp.tool()
     def list_fields(schema: str, encoding: str = "dbn", dataset: str | None = None) -> list[dict[str, str]]:
-        """List the fields of a schema: name, type, description and enum values."""
+        """List a schema's fields as ``{name, type}`` pairs (e.g. price, int64_t).
+
+        The API returns those two attributes per field and nothing else -- do not
+        expect prose or value sets, because the response carries none.
+        """
         return svc.list_fields(schema, encoding, dataset)
 
     @mcp.tool()
@@ -130,8 +134,19 @@ def build_server(
         end_date: str | None = None,
         stype_in: str = "raw_symbol",
         stype_out: str = "instrument_id",
+        limit: int | None = None,
+        offset: int = 0,
     ) -> dict[str, Any]:
-        """Resolve symbols to instrument ids over a date range (Symbology API)."""
+        """Resolve symbols to instrument ids over a date range (Symbology API).
+
+        The response is a **paged envelope**. ``result`` maps at most ``limit``
+        symbols (default 100, maximum 1000) to their instrument-id intervals;
+        ``total`` is the full number of matches and ``offset`` / ``next_offset`` /
+        ``truncated`` let a caller page through every match losslessly. A bulk
+        spec such as ``ALL_SYMBOLS`` on a US-equities dataset matches ~12k
+        symbols and is never returned whole -- keep paging while ``next_offset``
+        is not ``None``.
+        """
         return svc.resolve_symbols(
             dataset,
             symbols,
@@ -139,6 +154,8 @@ def build_server(
             end_date=end_date,
             stype_in=stype_in,
             stype_out=stype_out,
+            limit=limit,
+            offset=offset,
         )
 
     return mcp
