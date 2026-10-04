@@ -254,3 +254,5 @@ The recommendation above is now implemented on a branch.
   ~1.43 MB;
 - the `resolve_symbols` tool declares `limit`/`offset`; the `list_fields`
   description no longer promises prose/enum values.
+
+**PR:** https://github.com/nickbrett1/databento-discovery/pull/2 (branch `fix/resolve-symbols-pagination`).
